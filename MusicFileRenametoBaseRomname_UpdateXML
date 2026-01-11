@@ -1,0 +1,297 @@
+<# 
+.SYNOPSIS
+  Rename LaunchBox music MP3 files to ROM base names (from ApplicationPath) and update MusicPath/MissingMusic in the platform XML.
+#>
+function Sync-LaunchBoxMusicToUNCByRomBase {
+    [CmdletBinding(SupportsShouldProcess = $true, ConfirmImpact = 'Medium')]
+    param(
+        [Parameter(Mandatory)]
+        [ValidateScript({ Test-Path $_ -PathType Leaf })]
+        [string]$XmlPath,
+
+        [Parameter(Mandatory)]
+        [string]$PlatformName,
+
+        # Final MusicPath: \\Root\Music\<PlatformName>\<RomBase>.mp3
+        [string]$MusicRootUNC ,
+
+        # Folder that contains the mp3 files to rename (local OR UNC).
+        # Example: \\Root\path\Music\Nintendo Game Boy Advance
+        [string]$MusicFolderToRename,
+
+        # Fuzzy match threshold for rename mode
+        [ValidateRange(0.0, 1.0)]
+        [double]$MinScore = 0.72,
+
+        [switch]$AllowReuse,
+
+        [ValidateRange(1, 10000)]
+        [int]$SaveEvery = 25,
+
+        [int]$Limit = 0,
+
+        [switch]$BackupXml = $true
+    )
+
+    function Get-SafeFileName {
+        param([Parameter(Mandatory)][string]$Name)
+        $invalid = [System.IO.Path]::GetInvalidFileNameChars()
+        foreach ($c in $invalid) { $Name = $Name.Replace($c, '_') }
+        $Name = $Name.Trim().TrimEnd('.', ' ')
+        return $Name
+    }
+
+    function Normalize-Strict {
+        param([Parameter(Mandatory)][string]$s)
+        $t = $s.ToLowerInvariant()
+        $t = [regex]::Replace($t, '[^a-z0-9]+', ' ')
+        $t = [regex]::Replace($t, '\s+', ' ').Trim()
+        return $t
+    }
+
+    function Normalize-Loose {
+        param([Parameter(Mandatory)][string]$s)
+        $t = $s.ToLowerInvariant()
+        $t = [regex]::Replace($t, '\[[^\]]*\]', ' ')
+        $t = [regex]::Replace($t, '\([^\)]*\)', ' ')
+        $t = [regex]::Replace($t, '[^a-z0-9]+', ' ')
+        $t = [regex]::Replace($t, '\s+', ' ').Trim()
+        return $t
+    }
+
+    function TokenScore {
+        param([Parameter(Mandatory)][string]$A, [Parameter(Mandatory)][string]$B)
+
+        $a = Normalize-Strict $A
+        $b = Normalize-Strict $B
+        if ($a -eq $b) { return 1.0 }
+        if ($a.StartsWith($b) -or $b.StartsWith($a)) { return 0.95 }
+        if ($a.Contains($b) -or $b.Contains($a)) { return 0.90 }
+
+        $aTok = $a.Split(' ') | Where-Object { $_ }
+        $bTok = $b.Split(' ') | Where-Object { $_ }
+        if ($aTok.Count -eq 0 -or $bTok.Count -eq 0) { return 0.0 }
+
+        $set = New-Object 'System.Collections.Generic.HashSet[string]'
+        foreach ($t in $aTok) { [void]$set.Add($t) }
+
+        $intersect = 0
+        foreach ($t in $bTok) { if ($set.Contains($t)) { $intersect++ } }
+
+        return [Math]::Round((2.0 * $intersect) / ($aTok.Count + $bTok.Count), 4)
+    }
+
+    function BestScore {
+        param([Parameter(Mandatory)][string]$Key, [Parameter(Mandatory)][string]$Candidate)
+        $s1 = TokenScore -A $Key -B $Candidate
+        $s2 = TokenScore -A (Normalize-Loose $Key) -B (Normalize-Loose $Candidate)
+        return [Math]::Max($s1, $s2)
+    }
+
+    function Save-Xml {
+        param([xml]$Doc, [string]$Path, [ref]$BackupDone)
+
+        if ($BackupXml -and -not $BackupDone.Value) {
+            $stamp = Get-Date -Format "yyyyMMdd-HHmmss"
+            $backupPath = "$Path.bak.$stamp"
+            if ($PSCmdlet.ShouldProcess($Path, "Backup XML to '$backupPath'")) {
+                Copy-Item -LiteralPath $Path -Destination $backupPath -ErrorAction Stop
+                Write-Verbose "Backed up XML: $backupPath"
+                $BackupDone.Value = $true
+            } else {
+                Write-Verbose "[WhatIf] Backup XML to '$backupPath'"
+            }
+        }
+
+        if ($PSCmdlet.ShouldProcess($Path, "Save updated XML")) {
+            $utf8NoBom = New-Object System.Text.UTF8Encoding($false)
+            $settings = New-Object System.Xml.XmlWriterSettings
+            $settings.Indent = $true
+            $settings.Encoding = $utf8NoBom
+
+            Write-Verbose "Saving XML: $Path"
+            $writer = [System.Xml.XmlWriter]::Create($Path, $settings)
+            $Doc.Save($writer)
+            $writer.Close()
+            Write-Verbose "Saved XML OK."
+        } else {
+            Write-Verbose "[WhatIf] Save updated XML: $Path"
+        }
+    }
+
+    $MusicRootUNC = $MusicRootUNC.TrimEnd('\')
+
+    $renameMode = $false
+    if ($MusicFolderToRename -and (Test-Path -LiteralPath $MusicFolderToRename -PathType Container)) {
+        $renameMode = $true
+        Write-Verbose "Rename mode: ON (MusicFolderToRename exists)"
+    } else {
+        Write-Verbose "Rename mode: OFF (XML-only). MusicFolderToRename missing/not provided."
+    }
+
+    Write-Verbose "XML Path: $XmlPath"
+    Write-Verbose "PlatformName: $PlatformName"
+    Write-Verbose "MusicRootUNC: $MusicRootUNC"
+    if ($MusicFolderToRename) { Write-Verbose "MusicFolderToRename: $MusicFolderToRename" }
+
+    [xml]$xml = Get-Content -LiteralPath $XmlPath -Raw
+    $games = $xml.SelectNodes('//Game')
+    if (-not $games -or $games.Count -eq 0) { throw "No <Game> nodes found in '$XmlPath'." }
+
+    $candidates = @()
+    if ($renameMode) {
+        $mp3Files = Get-ChildItem -LiteralPath $MusicFolderToRename -Filter *.mp3 -File
+        if ($mp3Files.Count -eq 0) {
+            Write-Verbose "No mp3 files found in MusicFolderToRename. Falling back to XML-only."
+            $renameMode = $false
+        } else {
+            $candidates = foreach ($f in $mp3Files) {
+                [pscustomobject]@{
+                    FileInfo = $f
+                    BaseName = [System.IO.Path]::GetFileNameWithoutExtension($f.Name)
+                    Used     = $false
+                }
+            }
+        }
+    }
+
+    $results = New-Object System.Collections.Generic.List[object]
+    $processed = 0
+    $changedSinceSave = 0
+    $backupDone = $false
+
+    try {
+        foreach ($g in $games) {
+            if ($Limit -gt 0 -and $processed -ge $Limit) { break }
+            $processed++
+
+            $appNode = $g.SelectSingleNode('ApplicationPath')
+            if (-not $appNode -or [string]::IsNullOrWhiteSpace($appNode.InnerText)) { continue }
+
+            $romBaseRaw = [System.IO.Path]::GetFileNameWithoutExtension($appNode.InnerText.Trim())
+            if ([string]::IsNullOrWhiteSpace($romBaseRaw)) { continue }
+
+            $romBaseSafe = Get-SafeFileName $romBaseRaw
+            $targetLeaf  = $romBaseSafe + '.mp3'
+
+            # Ensure nodes exist
+            $musicNode = $g.SelectSingleNode('MusicPath')
+            if (-not $musicNode) { $musicNode = $xml.CreateElement('MusicPath'); [void]$g.AppendChild($musicNode) }
+
+            $missingNode = $g.SelectSingleNode('MissingMusic')
+            if (-not $missingNode) { $missingNode = $xml.CreateElement('MissingMusic'); [void]$g.AppendChild($missingNode) }
+
+            $oldMusicPath = $musicNode.InnerText
+            $oldMissing   = $missingNode.InnerText
+
+            $finalLeaf = $targetLeaf
+            $matchedName = $null
+            $bestScore = $null
+            $action = "XML only"
+
+            if ($renameMode) {
+                # Find best mp3 match
+                $best = $null
+                $bestScore = -1.0
+                foreach ($c in $candidates) {
+                    if (-not (Test-Path -LiteralPath $c.FileInfo.FullName)) { continue }
+                    if (-not $AllowReuse -and $c.Used) { continue }
+
+                    $score = BestScore -Key $romBaseRaw -Candidate $c.BaseName
+                    if ($score -gt $bestScore) { $bestScore = $score; $best = $c }
+                }
+
+                if ($best -and $bestScore -ge $MinScore) {
+                    $sourceItem = Get-Item -LiteralPath $best.FileInfo.FullName -ErrorAction SilentlyContinue
+                    if ($sourceItem) {
+                        $matchedName = $sourceItem.Name
+
+                        $targetPath = Join-Path $MusicFolderToRename $targetLeaf
+
+                        # Collision-safe target
+                        $finalPath = $targetPath
+                        $n = 2
+                        while ((Test-Path $finalPath) -and ((Get-Item -LiteralPath $finalPath).FullName -ne $sourceItem.FullName)) {
+                            $finalPath = Join-Path $MusicFolderToRename ("{0} ({1}).mp3" -f $romBaseSafe, $n)
+                            $n++
+                        }
+                        $finalLeaf = Split-Path $finalPath -Leaf
+
+                        if ($sourceItem.FullName -ne $finalPath) {
+                            $renameAction = "Rename '$($sourceItem.Name)' -> '$finalLeaf' (ROM '$romBaseRaw', score $bestScore)"
+                            if ($PSCmdlet.ShouldProcess($MusicFolderToRename, $renameAction)) {
+                                Write-Verbose $renameAction
+                                Rename-Item -LiteralPath $sourceItem.FullName -NewName $finalLeaf -ErrorAction Stop
+
+                                # refresh candidate
+                                $best.FileInfo = Get-Item -LiteralPath $finalPath -ErrorAction Stop
+                                $best.BaseName = [System.IO.Path]::GetFileNameWithoutExtension($best.FileInfo.Name)
+
+                                $action = "Rename + XML"
+                            } else {
+                                Write-Verbose "[WhatIf] $renameAction"
+                                $action = "Rename (WhatIf) + XML"
+                            }
+                        } else {
+                            $action = "Already named + XML"
+                        }
+
+                        if (-not $AllowReuse) { $best.Used = $true }
+                    }
+                } else {
+                    $action = "XML only (no good match)"
+                }
+            }
+
+            # UNC MusicPath always
+            $newMusicPath = "$MusicRootUNC\$PlatformName\$finalLeaf"
+
+            if ($musicNode.InnerText -ne $newMusicPath) { $musicNode.InnerText = $newMusicPath; $changedSinceSave++ }
+            if ($missingNode.InnerText -ne 'false')     { $missingNode.InnerText = 'false';     $changedSinceSave++ }
+
+            $results.Add([pscustomobject]@{
+                RomBase       = $romBaseRaw
+                Mp3Matched    = $matchedName
+                Score         = $bestScore
+                Mp3New        = $finalLeaf
+                MusicPath_Old = $oldMusicPath
+                MusicPath_New = $newMusicPath
+                Missing_Old   = $oldMissing
+                Missing_New   = 'false'
+                Action        = $action
+            }) | Out-Null
+
+            if ($changedSinceSave -ge $SaveEvery) {
+                Save-Xml -Doc $xml -Path $XmlPath -BackupDone ([ref]$backupDone)
+                $changedSinceSave = 0
+            }
+        }
+    }
+    finally {
+        if ($changedSinceSave -gt 0) {
+            Save-Xml -Doc $xml -Path $XmlPath -BackupDone ([ref]$backupDone)
+        }
+    }
+
+    $results
+}
+
+
+
+#(Preview)
+# Sync-LaunchBoxMusicToUNCByRomBase `
+#   -XmlPath "D:\Root\pathtoXML\[system name].xml" `
+#   -PlatformName "[System Name]" `
+#   -MusicRootUNC "[rootUNCpath]" `
+#   -MusicFolderToRename "\\root\folder\name\[System Name]" `
+#   -Verbose `
+#   -WhatIf
+
+
+#(Apply)
+Sync-LaunchBoxMusicToUNCByRomBase `
+#   -XmlPath "D:\Root\pathtoXML\[system name].xml" `
+#   -PlatformName "[System Name]" `
+#   -MusicRootUNC "[rootUNCpath]" `
+#   -MusicFolderToRename "\\root\folder\name\[System Name]" `
+#  -Verbose
