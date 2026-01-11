@@ -23,17 +23,3 @@ Scripts may include tasks like:
 - Generating reports for import review
 
 > ⚠️ Many LaunchBox settings and game libraries are stored in XML. Scripts that modify XML should be used carefully and always with backups.
-
-## Repository Structure (Suggested)
-
-```text
-.
-├─ scripts/
-│  ├─ xml/              # LaunchBox XML transforms / patching
-│  ├─ media/            # Artwork/video/media rename & audit tools
-│  ├─ reports/          # Inventory, missing media, duplicates, etc.
-│  ├─ import-tools/     # Helpers for preparing data prior to import
-│  └─ utilities/        # Shared helpers (logging, parsing, etc.)
-├─ examples/            # Sample inputs/outputs and usage examples
-├─ docs/                # Longer guides and workflow notes
-└─ README.md
